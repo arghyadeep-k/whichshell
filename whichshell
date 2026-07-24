@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Report which shell is currently running, where it lives, and other details."""
+
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+
+CONFIG_FILES = {
+    "bash": ["~/.bashrc", "~/.bash_profile", "~/.profile"],
+    "zsh": ["~/.zshrc", "~/.zprofile", "~/.zshenv"],
+    "fish": ["~/.config/fish/config.fish"],
+    "ksh": ["~/.kshrc", "~/.profile"],
+    "csh": ["~/.cshrc", "~/.login"],
+    "tcsh": ["~/.tcshrc", "~/.cshrc", "~/.login"],
+    "dash": ["~/.profile"],
+    "sh": ["~/.profile"],
+}
+
+
+def read_proc_shell(pid):
+    """Return (exe_path, argv) for pid via /proc, or (None, None)."""
+    try:
+        exe_path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe_path = None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+        argv = [p.decode(errors="replace") for p in raw.split(b"\0") if p]
+    except OSError:
+        argv = None
+    return exe_path, argv
+
+
+def read_parent_pid(pid):
+    """Return the PPID of the given pid, or None."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return int(out) if out else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def read_ps_shell(pid):
+    """Fallback for systems without /proc: use ps."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "comm=,args=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if not out:
+        return None, None
+    comm, _, args = out.partition(" ")
+    exe_path = shutil.which(comm) or comm
+    argv = args.split() if args else [comm]
+    return exe_path, argv
+
+
+def get_version(path):
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=2,
+        )
+        text = (result.stdout or result.stderr).strip()
+        return text.splitlines()[0] if text else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def find_config_files(shell_name):
+    candidates = CONFIG_FILES.get(shell_name, ["~/.profile"])
+    results = []
+    for c in candidates:
+        expanded = os.path.expanduser(c)
+        results.append((c, os.path.isfile(expanded)))
+    return results
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(f"Usage: {os.path.basename(sys.argv[0])}")
+        print("Reports the shell you are currently running, its location, and other details.")
+        return
+
+    ppid = os.getppid()
+
+    exe_path, argv = read_proc_shell(ppid)
+    if exe_path is None and argv is None:
+        exe_path, argv = read_ps_shell(ppid)
+
+    if not exe_path:
+        print("Could not determine the running shell (no /proc and `ps` unavailable).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    shell_name = os.path.basename(exe_path)
+    argv0 = argv[0] if argv else ""
+    rest = argv[1:] if argv else []
+    is_login = argv0.startswith("-") or "-l" in rest or "--login" in rest
+    is_interactive = any(a == "-i" or (a.startswith("-") and "i" in a and not a.startswith("--"))
+                          for a in rest)
+
+    version = get_version(exe_path)
+    config_files = find_config_files(shell_name)
+
+    default_shell = os.environ.get("SHELL")
+    try:
+        passwd_shell = pwd.getpwuid(os.getuid()).pw_shell
+    except KeyError:
+        passwd_shell = None
+
+    print(f"Shell:         {shell_name}")
+    print(f"Path:          {exe_path}")
+    print(f"Version:       {version or 'unknown'}")
+    shell_ppid = read_parent_pid(ppid)
+    print(f"PID / PPID:    {ppid} / {shell_ppid if shell_ppid is not None else 'unknown'}")
+    print(f"Login shell:   {'yes' if is_login else 'no'}")
+    print(f"Interactive:   {'yes' if is_interactive else 'unknown'}")
+
+    cfg_str = ", ".join(f"{path} ({'found' if found else 'not found'})" for path, found in config_files)
+    print(f"Config files:  {cfg_str}")
+
+    print()
+    if default_shell:
+        if os.path.realpath(default_shell) == os.path.realpath(exe_path):
+            print(f"Default login shell ($SHELL): {default_shell} (matches running shell)")
+        else:
+            print(f"Default login shell ($SHELL): {default_shell} (differs from running shell)")
+    elif passwd_shell:
+        print(f"Default login shell (/etc/passwd): {passwd_shell}")
+    else:
+        print("Default login shell: unknown ($SHELL not set)")
+
+
+if __name__ == "__main__":
+    main()
