@@ -1,5 +1,7 @@
 # whichshell
 
+[![CI](https://github.com/arghyadeep-k/whichshell/actions/workflows/ci.yml/badge.svg)](https://github.com/arghyadeep-k/whichshell/actions/workflows/ci.yml)
+
 Tells you which shell you're actually running, where its binary lives, and
 other relevant details (version, PID/PPID, login/interactive status, config
 files found, and how it compares to your default shell). Works on Linux,
@@ -40,4 +42,21 @@ git clone https://github.com/arghyadeep-k/whichshell.git
 cd whichshell
 ./install.sh       # Linux/macOS
 .\install.ps1       # Windows
+```
+
+## Tests
+
+Unit tests cover the detection logic (login/interactive flag parsing for
+both POSIX and Windows, CIM JSON parsing, config-file lookup) plus an
+end-to-end smoke test that actually runs the CLI. CI runs the suite on
+Linux, macOS, and Windows on every push via [GitHub
+Actions](.github/workflows/ci.yml) — the Windows job is the only place the
+Windows detection path (PowerShell CIM queries, the `.cmd` shim,
+`install.ps1`) gets exercised for real, since this was built without
+access to a Windows machine.
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install pytest
+pytest tests/ -v
 ```

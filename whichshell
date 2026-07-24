@@ -97,7 +97,52 @@ def find_config_files(shell_name):
     return results
 
 
+def detect_posix_flags(argv):
+    """Return (is_login, is_interactive) from a shell's argv.
+
+    is_interactive is None when neither -i nor -c is present, meaning the
+    caller should fall back to another signal (e.g. stdin.isatty())."""
+    argv0 = argv[0] if argv else ""
+    rest = argv[1:] if argv else []
+    is_login = argv0.startswith("-") or "-l" in rest or "--login" in rest
+    if any(a == "-i" or (a.startswith("-") and "i" in a and not a.startswith("--")) for a in rest):
+        is_interactive = True
+    elif "-c" in rest:
+        is_interactive = False
+    else:
+        is_interactive = None
+    return is_login, is_interactive
+
+
 # --- Windows (cmd.exe / PowerShell) detection -----------------------------
+
+def parse_win_cim_json(text):
+    """Parse Get-CimInstance ConvertTo-Json output into (exe_path, argv, parent_pid).
+
+    Returns (None, None, None) if text is empty or not valid JSON."""
+    text = (text or "").strip()
+    if not text:
+        return None, None, None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None, None, None
+    exe_path = data.get("ExecutablePath") or data.get("Name")
+    cmdline = data.get("CommandLine") or ""
+    argv = cmdline.split() if cmdline else [data.get("Name", "")]
+    return exe_path, argv, data.get("ParentProcessId")
+
+
+def detect_windows_interactive(shell_name, argv):
+    """Return True/False/None (unknown) for whether the Windows shell is interactive."""
+    rest = argv[1:] if argv else []
+    name = shell_name.lower()
+    if name in ("powershell.exe", "pwsh.exe"):
+        return not any(a.lower() == "-noninteractive" for a in rest)
+    if name == "cmd.exe":
+        return not any(a.lower() == "/c" for a in rest)
+    return None
+
 
 def read_windows_process(pid):
     """Return (exe_path, argv, parent_pid) for pid via PowerShell CIM, or (None, None, None)."""
@@ -116,17 +161,9 @@ def read_windows_process(pid):
             )
         except (OSError, subprocess.SubprocessError):
             continue
-        out = result.stdout.strip()
-        if not out:
-            continue
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            continue
-        exe_path = data.get("ExecutablePath") or data.get("Name")
-        cmdline = data.get("CommandLine") or ""
-        argv = cmdline.split() if cmdline else [data.get("Name", "")]
-        return exe_path, argv, data.get("ParentProcessId")
+        exe_path, argv, parent_pid = parse_win_cim_json(result.stdout)
+        if exe_path:
+            return exe_path, argv, parent_pid
     return None, None, None
 
 
@@ -207,30 +244,19 @@ def main():
         sys.exit(1)
 
     shell_name = os.path.basename(exe_path)
-    argv0 = argv[0] if argv else ""
-    rest = argv[1:] if argv else []
 
     if IS_WINDOWS:
         version = get_version_windows(exe_path, shell_name)
         config_files = find_config_files_windows(shell_name)
         is_login = None  # not a meaningful concept on Windows
-        if shell_name.lower() in ("powershell.exe", "pwsh.exe"):
-            is_interactive = not any(a.lower() == "-noninteractive" for a in rest)
-        elif shell_name.lower() == "cmd.exe":
-            is_interactive = not any(a.lower() in ("/c",) for a in rest)
-        else:
-            is_interactive = None
+        is_interactive = detect_windows_interactive(shell_name, argv)
     else:
         version = get_version(exe_path)
         config_files = find_config_files(shell_name)
-        is_login = argv0.startswith("-") or "-l" in rest or "--login" in rest
-        if any(a == "-i" or (a.startswith("-") and "i" in a and not a.startswith("--")) for a in rest):
-            is_interactive = True
-        elif "-c" in rest:
-            is_interactive = False
-        else:
-            # No explicit flag either way; fall back to whether our own
-            # stdin (inherited from the shell) is a terminal.
+        is_login, is_interactive = detect_posix_flags(argv)
+        if is_interactive is None:
+            # No explicit -i/-c flag either way; fall back to whether our
+            # own stdin (inherited from the shell) is a terminal.
             is_interactive = sys.stdin.isatty()
 
     print(f"Shell:         {shell_name}")
