@@ -1,4 +1,4 @@
-# whichshell
+# WhichShell
 
 [![CI](https://github.com/arghyadeep-k/whichshell/actions/workflows/ci.yml/badge.svg)](https://github.com/arghyadeep-k/whichshell/actions/workflows/ci.yml)
 
