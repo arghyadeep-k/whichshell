@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Report which shell is currently running, where it lives, and other details."""
 
+import json
 import os
-import pwd
 import shutil
 import subprocess
 import sys
+
+IS_WINDOWS = os.name == "nt"
+
+if not IS_WINDOWS:
+    import pwd
 
 CONFIG_FILES = {
     "bash": ["~/.bashrc", "~/.bash_profile", "~/.profile"],
@@ -18,6 +23,8 @@ CONFIG_FILES = {
     "sh": ["~/.profile"],
 }
 
+
+# --- POSIX (Linux/macOS) detection ---------------------------------------
 
 def read_proc_shell(pid):
     """Return (exe_path, argv) for pid via /proc, or (None, None)."""
@@ -54,7 +61,7 @@ def read_parent_pid(pid):
 
 
 def read_ps_shell(pid):
-    """Fallback for systems without /proc: use ps."""
+    """Fallback for POSIX systems without /proc (e.g. macOS): use ps."""
     try:
         out = subprocess.run(
             ["ps", "-o", "comm=,args=", "-p", str(pid)],
@@ -90,6 +97,90 @@ def find_config_files(shell_name):
     return results
 
 
+# --- Windows (cmd.exe / PowerShell) detection -----------------------------
+
+def read_windows_process(pid):
+    """Return (exe_path, argv, parent_pid) for pid via PowerShell CIM, or (None, None, None)."""
+    ps_cmd = (
+        f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\"; "
+        "if ($p) { [PSCustomObject]@{ "
+        "Name=$p.Name; ExecutablePath=$p.ExecutablePath; "
+        "CommandLine=$p.CommandLine; ParentProcessId=$p.ParentProcessId "
+        "} | ConvertTo-Json -Compress }"
+    )
+    for exe in ("powershell", "pwsh"):
+        try:
+            result = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = result.stdout.strip()
+        if not out:
+            continue
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            continue
+        exe_path = data.get("ExecutablePath") or data.get("Name")
+        cmdline = data.get("CommandLine") or ""
+        argv = cmdline.split() if cmdline else [data.get("Name", "")]
+        return exe_path, argv, data.get("ParentProcessId")
+    return None, None, None
+
+
+def get_version_windows(exe_path, shell_name):
+    name = shell_name.lower()
+    try:
+        if name in ("powershell.exe", "pwsh.exe"):
+            result = subprocess.run(
+                [exe_path, "-NoProfile", "-NonInteractive", "-Command",
+                 "$PSVersionTable.PSVersion.ToString()"],
+                capture_output=True, text=True, timeout=5,
+            )
+            text = result.stdout.strip()
+            return f"PowerShell {text}" if text else None
+        if name == "cmd.exe":
+            result = subprocess.run(["cmd", "/c", "ver"], capture_output=True, text=True, timeout=5)
+            text = result.stdout.strip()
+            return text.splitlines()[-1] if text else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def read_cmd_autorun():
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Command Processor") as key:
+            value, _ = winreg.QueryValueEx(key, "AutoRun")
+            return value
+    except OSError:
+        return None
+
+
+def find_config_files_windows(shell_name):
+    name = shell_name.lower()
+    home = os.path.expanduser("~")
+    if name in ("powershell.exe", "pwsh.exe"):
+        candidates = [
+            os.path.join(home, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1"),
+            os.path.join(home, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"),
+        ]
+        return [(c, os.path.isfile(c)) for c in candidates]
+    if name == "cmd.exe":
+        autorun = read_cmd_autorun()
+        label = r"HKCU\Software\Microsoft\Command Processor\AutoRun"
+        return [(label, autorun is not None)]
+    return []
+
+
+# --- main -------------------------------------------------------------
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print(f"Usage: {os.path.basename(sys.argv[0])}")
@@ -98,52 +189,92 @@ def main():
 
     ppid = os.getppid()
 
-    exe_path, argv = read_proc_shell(ppid)
-    if exe_path is None and argv is None:
-        exe_path, argv = read_ps_shell(ppid)
+    if IS_WINDOWS:
+        exe_path, argv, shell_ppid = read_windows_process(ppid)
+    else:
+        exe_path, argv = read_proc_shell(ppid)
+        if exe_path is None and argv is None:
+            exe_path, argv = read_ps_shell(ppid)
+        shell_ppid = read_parent_pid(ppid)
 
     if not exe_path:
-        print("Could not determine the running shell (no /proc and `ps` unavailable).",
-              file=sys.stderr)
+        print("Could not determine the running shell.", file=sys.stderr)
+        if IS_WINDOWS:
+            print("(PowerShell or pwsh is required on the PATH to query process details.)",
+                  file=sys.stderr)
+        else:
+            print("(no /proc and `ps` unavailable)", file=sys.stderr)
         sys.exit(1)
 
     shell_name = os.path.basename(exe_path)
     argv0 = argv[0] if argv else ""
     rest = argv[1:] if argv else []
-    is_login = argv0.startswith("-") or "-l" in rest or "--login" in rest
-    is_interactive = any(a == "-i" or (a.startswith("-") and "i" in a and not a.startswith("--"))
-                          for a in rest)
 
-    version = get_version(exe_path)
-    config_files = find_config_files(shell_name)
-
-    default_shell = os.environ.get("SHELL")
-    try:
-        passwd_shell = pwd.getpwuid(os.getuid()).pw_shell
-    except KeyError:
-        passwd_shell = None
+    if IS_WINDOWS:
+        version = get_version_windows(exe_path, shell_name)
+        config_files = find_config_files_windows(shell_name)
+        is_login = None  # not a meaningful concept on Windows
+        if shell_name.lower() in ("powershell.exe", "pwsh.exe"):
+            is_interactive = not any(a.lower() == "-noninteractive" for a in rest)
+        elif shell_name.lower() == "cmd.exe":
+            is_interactive = not any(a.lower() in ("/c",) for a in rest)
+        else:
+            is_interactive = None
+    else:
+        version = get_version(exe_path)
+        config_files = find_config_files(shell_name)
+        is_login = argv0.startswith("-") or "-l" in rest or "--login" in rest
+        if any(a == "-i" or (a.startswith("-") and "i" in a and not a.startswith("--")) for a in rest):
+            is_interactive = True
+        elif "-c" in rest:
+            is_interactive = False
+        else:
+            # No explicit flag either way; fall back to whether our own
+            # stdin (inherited from the shell) is a terminal.
+            is_interactive = sys.stdin.isatty()
 
     print(f"Shell:         {shell_name}")
     print(f"Path:          {exe_path}")
     print(f"Version:       {version or 'unknown'}")
-    shell_ppid = read_parent_pid(ppid)
     print(f"PID / PPID:    {ppid} / {shell_ppid if shell_ppid is not None else 'unknown'}")
-    print(f"Login shell:   {'yes' if is_login else 'no'}")
-    print(f"Interactive:   {'yes' if is_interactive else 'unknown'}")
+    if is_login is None:
+        print("Login shell:   n/a (Windows)")
+    else:
+        print(f"Login shell:   {'yes' if is_login else 'no'}")
+    print(f"Interactive:   {'unknown' if is_interactive is None else ('yes' if is_interactive else 'no')}")
 
-    cfg_str = ", ".join(f"{path} ({'found' if found else 'not found'})" for path, found in config_files)
+    if config_files:
+        cfg_str = ", ".join(f"{path} ({'found' if found else 'not found'})" for path, found in config_files)
+    else:
+        cfg_str = "none known for this shell"
     print(f"Config files:  {cfg_str}")
 
     print()
-    if default_shell:
-        if os.path.realpath(default_shell) == os.path.realpath(exe_path):
-            print(f"Default login shell ($SHELL): {default_shell} (matches running shell)")
+    if IS_WINDOWS:
+        comspec = os.environ.get("COMSPEC")
+        if comspec:
+            if os.path.realpath(comspec) == os.path.realpath(exe_path):
+                print(f"System default command processor (COMSPEC): {comspec} (matches running shell)")
+            else:
+                print(f"System default command processor (COMSPEC): {comspec} (differs from running shell)")
         else:
-            print(f"Default login shell ($SHELL): {default_shell} (differs from running shell)")
-    elif passwd_shell:
-        print(f"Default login shell (/etc/passwd): {passwd_shell}")
+            print("System default command processor: unknown (COMSPEC not set)")
     else:
-        print("Default login shell: unknown ($SHELL not set)")
+        default_shell = os.environ.get("SHELL")
+        try:
+            passwd_shell = pwd.getpwuid(os.getuid()).pw_shell
+        except KeyError:
+            passwd_shell = None
+
+        if default_shell:
+            if os.path.realpath(default_shell) == os.path.realpath(exe_path):
+                print(f"Default login shell ($SHELL): {default_shell} (matches running shell)")
+            else:
+                print(f"Default login shell ($SHELL): {default_shell} (differs from running shell)")
+        elif passwd_shell:
+            print(f"Default login shell (/etc/passwd): {passwd_shell}")
+        else:
+            print("Default login shell: unknown ($SHELL not set)")
 
 
 if __name__ == "__main__":
